@@ -1,28 +1,49 @@
 """
 bot/scanner.py - Market Scanner
 
-Uses yfinance for all bar/price data (free, no subscription needed).
-Alpaca is used only for order execution, not data.
-
-Downloads symbols in batches of 10 to avoid Yahoo Finance rate limits.
+Uses yfinance Ticker per-symbol with browser-like headers to bypass
+Yahoo Finance datacenter IP blocks (common on Railway/AWS/GCP).
+Alpaca is only used for order execution.
 """
 from __future__ import annotations
 
 import logging
 import time
+import random
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Optional
 
 import pandas as pd
+import requests
 import yfinance as yf
 
 from config import config
 
 log = logging.getLogger(__name__)
 
-BATCH_SIZE  = 10   # symbols per yfinance request
-BATCH_DELAY = 1.5  # seconds between batches
+PER_SYMBOL_DELAY = 0.4   # seconds between individual ticker fetches
+MAX_SYMBOLS      = 40    # cap total symbols per scan to keep cycle fast
+
+# Rotate user-agents to avoid Yahoo blocking datacenter IPs
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+]
+
+
+def _make_session() -> requests.Session:
+    """Create a requests session with browser-like headers."""
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    })
+    return session
 
 
 # ---------------------------------------------------------------------------
@@ -60,15 +81,15 @@ class ScanResult:
 DEFAULT_WATCHLIST = [
     "AAPL", "TSLA", "NVDA", "AMD", "META", "GOOGL", "AMZN", "MSFT",
     "SPY", "QQQ", "SOXL", "TQQQ",
-    "MARA", "RIOT", "COIN", "HOOD", "SOFI", "PLTR", "LCID",
+    "MARA", "RIOT", "COIN", "HOOD", "SOFI", "PLTR",
     "NIO", "RIVN", "GME", "AMC",
 ]
 
 
-def get_top_gainers_yf(n: int = 20) -> List[str]:
-    """Fetch today's top gainers from Yahoo Finance screener."""
+def get_top_gainers_yf(n: int = 15) -> List[str]:
+    """Fetch top gainers from Yahoo Finance screener."""
     try:
-        import requests
+        session = _make_session()
         url = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
         params = {
             "formatted": "false",
@@ -77,8 +98,7 @@ def get_top_gainers_yf(n: int = 20) -> List[str]:
             "scrIds": "day_gainers",
             "count": n,
         }
-        headers = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        resp = session.get(url, params=params, timeout=10)
         data = resp.json()
         quotes = data["finance"]["result"][0]["quotes"]
         symbols = [q["symbol"] for q in quotes]
@@ -101,59 +121,42 @@ class Scanner:
         )
 
     def scan(self) -> List[ScanResult]:
-        gainers = get_top_gainers_yf(20)
-        symbols = list(dict.fromkeys(self.watchlist + gainers))
-        log.info(f"Scanning {len(symbols)} symbols in batches of {BATCH_SIZE}...")
-
-        # Download in small batches to avoid Yahoo rate limiting
-        all_data: dict = {}
-        batches = [symbols[i:i+BATCH_SIZE] for i in range(0, len(symbols), BATCH_SIZE)]
-        for idx, batch in enumerate(batches):
-            try:
-                raw = yf.download(
-                    tickers=batch,
-                    period="25d",
-                    interval="1d",
-                    group_by="ticker",
-                    auto_adjust=True,
-                    progress=False,
-                    threads=False,  # serial within batch to reduce connections
-                )
-                if not raw.empty:
-                    for sym in batch:
-                        try:
-                            if isinstance(raw.columns, pd.MultiIndex):
-                                if sym in raw.columns.get_level_values(1):
-                                    all_data[sym] = raw.xs(sym, axis=1, level=1).dropna(how="all")
-                            else:
-                                # Single ticker download
-                                all_data[sym] = raw.dropna(how="all")
-                        except Exception:
-                            pass
-            except Exception as exc:
-                log.warning(f"Batch {idx+1} download error: {exc}")
-
-            if idx < len(batches) - 1:
-                time.sleep(BATCH_DELAY)
-
-        log.info(f"Downloaded data for {len(all_data)} symbols.")
+        gainers = get_top_gainers_yf(15)
+        symbols = list(dict.fromkeys(self.watchlist + gainers))[:MAX_SYMBOLS]
+        log.info(f"Scanning {len(symbols)} symbols...")
 
         results = []
-        for symbol, df in all_data.items():
+        session = _make_session()
+
+        for symbol in symbols:
+            df = self._fetch_ticker(symbol, session)
+            if df is None or df.empty:
+                continue
             result = self._analyze(symbol, df)
             if result and self._passes_filters(result):
                 result.score = self._score(result)
                 results.append(result)
+            time.sleep(PER_SYMBOL_DELAY)
 
         results.sort(key=lambda r: r.score, reverse=True)
-        log.info(f"Scan complete: {len(results)} candidates from {len(all_data)} symbols.")
+        log.info(f"Scan complete: {len(results)} candidates from {len(symbols)} symbols.")
         return results
+
+    def _fetch_ticker(self, symbol: str, session: requests.Session) -> Optional[pd.DataFrame]:
+        """Fetch 25 days of daily bars for a single symbol."""
+        try:
+            ticker = yf.Ticker(symbol, session=session)
+            df = ticker.history(period="25d", interval="1d", auto_adjust=True)
+            if df.empty:
+                return None
+            df.columns = [c.lower() for c in df.columns]
+            return df
+        except Exception as exc:
+            log.debug(f"Fetch error {symbol}: {exc}")
+            return None
 
     def _analyze(self, symbol: str, df: pd.DataFrame) -> Optional[ScanResult]:
         try:
-            df = df.copy()
-            df.columns = [c.lower() for c in df.columns]
-
             if len(df) < 3:
                 return None
 
@@ -170,8 +173,7 @@ class Scanner:
             if not (config.MIN_PRICE <= close_price <= config.MAX_PRICE):
                 return None
 
-            gap_pct = ((open_price - prev_close) / prev_close) * 100
-
+            gap_pct    = ((open_price - prev_close) / prev_close) * 100
             hist_vol   = df["volume"].iloc[:-1].tail(20)
             avg_volume = float(hist_vol.mean()) if len(hist_vol) > 0 else 0
 
@@ -209,7 +211,7 @@ class Scanner:
                 atr=atr,
             )
         except Exception as exc:
-            log.debug(f"Analysis error for {symbol}: {exc}")
+            log.debug(f"Analysis error {symbol}: {exc}")
             return None
 
     def _passes_filters(self, r: ScanResult) -> bool:
