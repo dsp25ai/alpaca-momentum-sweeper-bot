@@ -39,10 +39,12 @@ class RiskManager:
     """
 
     def __init__(self) -> None:
-        self._reset_daily()
-        self._last_trade_date: date = date.today()
+        # Must initialize _symbol_cooldowns BEFORE calling _reset_daily()
+        # because _reset_daily() calls self._symbol_cooldowns.clear()
         self._symbol_cooldowns: Dict[str, datetime] = {}
         self.COOLDOWN_MINUTES: int = 30  # min gap between re-entries on same symbol
+        self._last_trade_date: date = date.today()
+        self._reset_daily()
 
     # ------------------------------------------------------------------ #
     # Daily reset
