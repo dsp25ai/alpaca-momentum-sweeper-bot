@@ -1,7 +1,7 @@
 """Alpaca Momentum Sweeper Bot - bot package"""
 
-from .scanner import MarketScanner
-from .strategy import MomentumStrategy
+from .scanner import Scanner
+from .strategy import StrategyEngine
 from .executor import Executor
 from .risk import RiskManager
 from .portfolio import Portfolio
@@ -9,8 +9,8 @@ from .notifier import Notifier
 from .backtest import Backtester
 
 __all__ = [
-    "MarketScanner",
-    "MomentumStrategy",
+    "Scanner",
+    "StrategyEngine",
     "Executor",
     "RiskManager",
     "Portfolio",
