@@ -4,14 +4,14 @@ bot/scanner.py - Market Scanner
 Uses yfinance for all bar/price data (free, no subscription needed).
 Alpaca is used only for order execution, not data.
 
-Filters by: price range, avg volume, gap %, relative volume.
-Returns ranked ScanResult list for the strategy engine.
+Downloads symbols in batches of 10 to avoid Yahoo Finance rate limits.
 """
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List, Optional
 
 import pandas as pd
@@ -21,6 +21,9 @@ from config import config
 
 log = logging.getLogger(__name__)
 
+BATCH_SIZE  = 10   # symbols per yfinance request
+BATCH_DELAY = 1.5  # seconds between batches
+
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -28,7 +31,6 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class ScanResult:
-    """A stock that passed all scanner filters."""
     symbol: str
     price: float
     gap_pct: float
@@ -63,7 +65,7 @@ DEFAULT_WATCHLIST = [
 ]
 
 
-def get_top_gainers_yf(n: int = 30) -> List[str]:
+def get_top_gainers_yf(n: int = 20) -> List[str]:
     """Fetch today's top gainers from Yahoo Finance screener."""
     try:
         import requests
@@ -92,10 +94,6 @@ def get_top_gainers_yf(n: int = 30) -> List[str]:
 # ---------------------------------------------------------------------------
 
 class Scanner:
-    """
-    Scans a watchlist using yfinance for bar data.
-    Alpaca keys are NOT needed here — data is free via Yahoo Finance.
-    """
 
     def __init__(self, extra_symbols: Optional[List[str]] = None) -> None:
         self.watchlist: List[str] = list(
@@ -103,52 +101,56 @@ class Scanner:
         )
 
     def scan(self) -> List[ScanResult]:
-        """Run full scan. Returns filtered + ranked results."""
-        gainers = get_top_gainers_yf(30)
+        gainers = get_top_gainers_yf(20)
         symbols = list(dict.fromkeys(self.watchlist + gainers))
-        log.info(f"Scanning {len(symbols)} symbols...")
+        log.info(f"Scanning {len(symbols)} symbols in batches of {BATCH_SIZE}...")
+
+        # Download in small batches to avoid Yahoo rate limiting
+        all_data: dict = {}
+        batches = [symbols[i:i+BATCH_SIZE] for i in range(0, len(symbols), BATCH_SIZE)]
+        for idx, batch in enumerate(batches):
+            try:
+                raw = yf.download(
+                    tickers=batch,
+                    period="25d",
+                    interval="1d",
+                    group_by="ticker",
+                    auto_adjust=True,
+                    progress=False,
+                    threads=False,  # serial within batch to reduce connections
+                )
+                if not raw.empty:
+                    for sym in batch:
+                        try:
+                            if isinstance(raw.columns, pd.MultiIndex):
+                                if sym in raw.columns.get_level_values(1):
+                                    all_data[sym] = raw.xs(sym, axis=1, level=1).dropna(how="all")
+                            else:
+                                # Single ticker download
+                                all_data[sym] = raw.dropna(how="all")
+                        except Exception:
+                            pass
+            except Exception as exc:
+                log.warning(f"Batch {idx+1} download error: {exc}")
+
+            if idx < len(batches) - 1:
+                time.sleep(BATCH_DELAY)
+
+        log.info(f"Downloaded data for {len(all_data)} symbols.")
 
         results = []
-        # Batch download all symbols at once — much faster than one-by-one
-        try:
-            raw = yf.download(
-                tickers=symbols,
-                period="25d",
-                interval="1d",
-                group_by="ticker",
-                auto_adjust=True,
-                progress=False,
-                threads=True,
-            )
-        except Exception as exc:
-            log.error(f"yfinance batch download error: {exc}")
-            return []
-
-        if raw.empty:
-            log.warning("No bar data returned from yfinance.")
-            return []
-
-        for symbol in symbols:
-            result = self._analyze(symbol, raw)
+        for symbol, df in all_data.items():
+            result = self._analyze(symbol, df)
             if result and self._passes_filters(result):
                 result.score = self._score(result)
                 results.append(result)
 
         results.sort(key=lambda r: r.score, reverse=True)
-        log.info(f"Scan complete: {len(results)} candidates from {len(symbols)} symbols.")
+        log.info(f"Scan complete: {len(results)} candidates from {len(all_data)} symbols.")
         return results
 
-    def _analyze(self, symbol: str, raw: pd.DataFrame) -> Optional[ScanResult]:
-        """Extract metrics for a single symbol from the batch download."""
+    def _analyze(self, symbol: str, df: pd.DataFrame) -> Optional[ScanResult]:
         try:
-            # Handle both single and multi-ticker DataFrame structures
-            if isinstance(raw.columns, pd.MultiIndex):
-                if symbol not in raw.columns.get_level_values(1):
-                    return None
-                df = raw.xs(symbol, axis=1, level=1).dropna(how="all")
-            else:
-                df = raw.dropna(how="all")
-
             df = df.copy()
             df.columns = [c.lower() for c in df.columns]
 
@@ -168,24 +170,20 @@ class Scanner:
             if not (config.MIN_PRICE <= close_price <= config.MAX_PRICE):
                 return None
 
-            # Gap %
             gap_pct = ((open_price - prev_close) / prev_close) * 100
 
-            # 20-day avg volume (excluding today)
-            hist_vol = df["volume"].iloc[:-1].tail(20)
+            hist_vol   = df["volume"].iloc[:-1].tail(20)
             avg_volume = float(hist_vol.mean()) if len(hist_vol) > 0 else 0
 
-            # Projected RVOL
-            now = datetime.utcnow()
+            now          = datetime.utcnow()
             market_open  = now.replace(hour=13, minute=30, second=0, microsecond=0)
             market_close = now.replace(hour=20, minute=0,  second=0, microsecond=0)
-            elapsed   = max((now - market_open).total_seconds(), 1)
-            day_secs  = (market_close - market_open).total_seconds()
-            day_frac  = min(elapsed / day_secs, 1.0)
-            proj_vol  = today_vol / day_frac if day_frac > 0.05 else today_vol
-            rvol      = proj_vol / avg_volume if avg_volume > 0 else 0
+            elapsed  = max((now - market_open).total_seconds(), 1)
+            day_secs = (market_close - market_open).total_seconds()
+            day_frac = min(elapsed / day_secs, 1.0)
+            proj_vol = today_vol / day_frac if day_frac > 0.05 else today_vol
+            rvol     = proj_vol / avg_volume if avg_volume > 0 else 0
 
-            # ATR (14-day)
             highs  = df["high"].values
             lows   = df["low"].values
             closes = df["close"].values
@@ -221,7 +219,7 @@ class Scanner:
             (r.avg_volume >= config.MIN_AVG_VOLUME,  f"AvgVol {r.avg_volume:.0f} < {config.MIN_AVG_VOLUME}"),
             (r.price >= config.MIN_PRICE,            f"Price ${r.price:.2f} < ${config.MIN_PRICE}"),
             (r.price <= config.MAX_PRICE,            f"Price ${r.price:.2f} > ${config.MAX_PRICE}"),
-            (r.atr > 0,                              "ATR = 0 (insufficient history)"),
+            (r.atr > 0,                              "ATR = 0"),
         ]
         for passed, reason in checks:
             if not passed:
@@ -237,9 +235,9 @@ class Scanner:
         score      = rvol_score + gap_score + mom_score
 
         notes = []
-        if r.rvol >= 5:      notes.append(f"RVOL {r.rvol:.1f}x")
-        if r.gap_pct >= 10:  notes.append(f"BIG GAP {r.gap_pct:.1f}%")
-        if intraday >= 5:    notes.append(f"RUNNING +{intraday:.1f}%")
+        if r.rvol >= 5:     notes.append(f"RVOL {r.rvol:.1f}x")
+        if r.gap_pct >= 10: notes.append(f"BIG GAP {r.gap_pct:.1f}%")
+        if intraday >= 5:   notes.append(f"RUNNING +{intraday:.1f}%")
         r.notes = notes
 
         return round(score, 2)
