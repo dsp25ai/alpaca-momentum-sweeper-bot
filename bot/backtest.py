@@ -1,233 +1,280 @@
 """
 bot/backtest.py - Historical Backtesting Module
 
-Runs the ORB and VWAP strategies against historical daily bar data
-fetched from Alpaca. Simulates entries, stops, and targets using
-the same logic as the live strategy engine.
+FINAL FIX: Uses Alpaca Data API v2 REST directly (same as scanner.py).
+No yfinance, no alpaca-trade-api SDK dependency.
+Simulates ORB/VWAP entries, bracket stops/targets on daily bars.
 
 Usage:
-    python main.py --backtest --symbols TSLA NVDA --days 30
+    python main.py --backtest --symbols TSLA NVDA AMD --days 60
 """
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 
 import pandas as pd
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+import requests
 
 from config import config
 
 log = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Alpaca Data REST helper (shared pattern with scanner.py)
+# ---------------------------------------------------------------------------
+
+ALPACA_DATA_BASE = "https://data.alpaca.markets/v2"
+
+
+def _alpaca_headers() -> dict:
+    return {
+        "APCA-API-KEY-ID": config.ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": config.ALPACA_SECRET_KEY,
+        "Accept": "application/json",
+    }
+
+
+def _fetch_daily_bars(symbol: str, days: int = 60) -> Optional[pd.DataFrame]:
+    """
+    Fetch `days` of daily OHLCV bars for `symbol` via Alpaca Data API v2.
+    Returns DataFrame or None.
+    """
+    try:
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=days + 15)  # buffer for holidays
+        url = f"{ALPACA_DATA_BASE}/stocks/{symbol}/bars"
+        params = {
+            "timeframe": "1Day",
+            "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "limit": days + 15,
+            "adjustment": "split",
+            "feed": "iex",
+        }
+        resp = requests.get(url, headers=_alpaca_headers(), params=params, timeout=15)
+        if resp.status_code == 422:
+            params["feed"] = "sip"
+            resp = requests.get(url, headers=_alpaca_headers(), params=params, timeout=15)
+        if resp.status_code != 200:
+            log.warning(f"Alpaca backtest bars {symbol}: HTTP {resp.status_code}")
+            return None
+        bars = resp.json().get("bars", [])
+        if not bars:
+            return None
+        df = pd.DataFrame(bars)
+        df.rename(
+            columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume", "t": "time"},
+            inplace=True,
+        )
+        df["time"] = pd.to_datetime(df["time"])
+        df.set_index("time", inplace=True)
+        df = df[["open", "high", "low", "close", "volume"]].sort_index()
+        return df.tail(days)
+    except Exception as exc:
+        log.warning(f"Backtest fetch error {symbol}: {exc}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
 
 @dataclass
 class BacktestTrade:
     symbol: str
-    strategy: str
     entry_date: str
     entry_price: float
-    stop_loss: float
-    take_profit: float
+    exit_date: str
     exit_price: float
+    shares: float
     pnl: float
-    outcome: str  # WIN | LOSS | OPEN
-    shares: int
+    pnl_pct: float
+    exit_reason: str
+    gap_pct: float
+    rvol: float
 
 
 @dataclass
 class BacktestResult:
     symbol: str
     trades: List[BacktestTrade] = field(default_factory=list)
+    total_pnl: float = 0.0
+    win_rate: float = 0.0
+    avg_win: float = 0.0
+    avg_loss: float = 0.0
+    max_drawdown: float = 0.0
+    sharpe: float = 0.0
+    total_trades: int = 0
 
-    @property
-    def total_pnl(self) -> float:
-        return sum(t.pnl for t in self.trades)
 
-    @property
-    def win_rate(self) -> float:
-        wins = sum(1 for t in self.trades if t.outcome == "WIN")
-        total = len(self.trades)
-        return (wins / total * 100) if total > 0 else 0
-
-    @property
-    def num_trades(self) -> int:
-        return len(self.trades)
-
-    def summary(self) -> str:
-        return (
-            f"{self.symbol}: {self.num_trades} trades | "
-            f"WinRate={self.win_rate:.0f}% | "
-            f"NetPnL=${self.total_pnl:+.2f}"
-        )
-
+# ---------------------------------------------------------------------------
+# Backtester
+# ---------------------------------------------------------------------------
 
 class Backtester:
-    """
-    Simple historical backtester.
-
-    Fetches daily OHLCV bars and simulates the gap+RVOL scanner
-    followed by ORB-style entries (buy next open after signal,
-    exit at EOD price if neither SL nor TP is hit intraday).
-
-    Note: This is a daily-bar simulation - intraday path is
-    approximated using high/low of the bar. For true intraday
-    backtest, switch to 5-min bars.
-    """
-
-    def __init__(self) -> None:
-        self.data_client = StockHistoricalDataClient(
-            api_key=config.ALPACA_API_KEY,
-            secret_key=config.ALPACA_SECRET_KEY,
-        )
-
-    def run(
+    def __init__(
         self,
-        symbols: List[str],
-        lookback_days: int = 30,
-    ) -> List[BacktestResult]:
-        """Run backtest for all symbols. Returns list of BacktestResult."""
+        symbols: Optional[List[str]] = None,
+        lookback_days: int = 60,
+        risk_per_trade: float = 0.02,
+        rr_ratio: float = 2.0,
+        stop_atr_mult: float = 1.5,
+    ):
+        self.symbols = symbols or ["TSLA", "NVDA", "AMD", "AAPL", "META"]
+        self.lookback_days = lookback_days
+        self.risk_per_trade = risk_per_trade
+        self.rr_ratio = rr_ratio
+        self.stop_atr_mult = stop_atr_mult
+        self.account_size = 10_000.0  # simulated account
+
+    def run(self, symbols: Optional[List[str]] = None, lookback_days: Optional[int] = None) -> List[BacktestResult]:
+        syms = symbols or self.symbols
+        days = lookback_days or self.lookback_days
         results = []
-        for symbol in symbols:
-            log.info(f"Backtesting {symbol} over {lookback_days} days...")
-            result = self._backtest_symbol(symbol, lookback_days)
+        for sym in syms:
+            log.info(f"Backtesting {sym} over {days} days...")
+            df = _fetch_daily_bars(sym, days=days)
+            if df is None or len(df) < 10:
+                log.warning(f"Not enough data for {sym}")
+                continue
+            result = self._backtest_symbol(sym, df)
             results.append(result)
-            log.info(result.summary())
         return results
 
-    def print_report(self, results: List[BacktestResult]) -> None:
-        """Print full backtest report to console."""
-        print("\n" + "=" * 60)
-        print(f"BACKTEST REPORT ({datetime.utcnow().date()})")
-        print("=" * 60)
-
-        total_pnl = 0.0
-        total_trades = 0
-        all_wins = 0
-
-        for r in results:
-            print(f"\n{r.summary()}")
-            for t in r.trades:
-                print(
-                    f"  [{t.outcome:4s}] {t.entry_date} | "
-                    f"Entry=${t.entry_price:.2f} "
-                    f"Exit=${t.exit_price:.2f} "
-                    f"PnL=${t.pnl:+.2f}"
-                )
-            total_pnl += r.total_pnl
-            total_trades += r.num_trades
-            all_wins += sum(1 for t in r.trades if t.outcome == "WIN")
-
-        print("\n" + "=" * 60)
-        overall_wr = (all_wins / total_trades * 100) if total_trades > 0 else 0
-        print(f"TOTAL: {total_trades} trades | WinRate={overall_wr:.0f}% | NetPnL=${total_pnl:+.2f}")
-        print("=" * 60 + "\n")
-
-    def _backtest_symbol(self, symbol: str, lookback_days: int) -> BacktestResult:
+    def _backtest_symbol(self, symbol: str, df: pd.DataFrame) -> BacktestResult:
         result = BacktestResult(symbol=symbol)
-        try:
-            end = datetime.utcnow()
-            start = end - timedelta(days=lookback_days + 10)
-            req = StockBarsRequest(
-                symbol_or_symbols=symbol,
-                timeframe=TimeFrame.Day,
-                start=start,
-                end=end,
+        equity = self.account_size
+        peak = equity
+
+        for i in range(5, len(df) - 1):
+            today = df.iloc[i]
+            prev = df.iloc[i - 1]
+            hist = df.iloc[i - 20:i]
+
+            open_price = float(today["open"])
+            high_price = float(today["high"])
+            low_price  = float(today["low"])
+            close_price = float(today["close"])
+            prev_close = float(prev["close"])
+            today_vol  = float(today["volume"])
+            avg_vol    = float(hist["volume"].mean()) if len(hist) > 0 else 1
+
+            # Filters
+            gap_pct = ((open_price - prev_close) / prev_close) * 100 if prev_close else 0
+            rvol    = today_vol / avg_vol if avg_vol > 0 else 0
+
+            if gap_pct < config.MIN_GAP_PCT:
+                continue
+            if rvol < config.MIN_RVOL:
+                continue
+            if not (config.MIN_PRICE <= close_price <= config.MAX_PRICE):
+                continue
+
+            # ATR for stop sizing
+            tr_list = [
+                max(
+                    float(df.iloc[j]["high"]) - float(df.iloc[j]["low"]),
+                    abs(float(df.iloc[j]["high"]) - float(df.iloc[j - 1]["close"])),
+                    abs(float(df.iloc[j]["low"]) - float(df.iloc[j - 1]["close"])),
+                )
+                for j in range(max(i - 14, 1), i)
+            ]
+            atr = float(pd.Series(tr_list).mean()) if tr_list else 0
+            if atr <= 0:
+                continue
+
+            # Entry: buy on open of today
+            entry_price = open_price
+            stop_price  = entry_price - (atr * self.stop_atr_mult)
+            target_price = entry_price + (atr * self.stop_atr_mult * self.rr_ratio)
+
+            risk_amount = equity * self.risk_per_trade
+            risk_per_share = entry_price - stop_price
+            if risk_per_share <= 0:
+                continue
+            shares = risk_amount / risk_per_share
+
+            # Simulate exit: check same day's high/low for bracket hit
+            exit_price = close_price
+            exit_reason = "close"
+
+            if high_price >= target_price:
+                exit_price = target_price
+                exit_reason = "target"
+            elif low_price <= stop_price:
+                exit_price = stop_price
+                exit_reason = "stop"
+
+            pnl = (exit_price - entry_price) * shares
+            pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+            equity += pnl
+            peak = max(peak, equity)
+
+            trade = BacktestTrade(
+                symbol=symbol,
+                entry_date=str(df.index[i].date()),
+                entry_price=round(entry_price, 2),
+                exit_date=str(df.index[i].date()),
+                exit_price=round(exit_price, 2),
+                shares=round(shares, 2),
+                pnl=round(pnl, 2),
+                pnl_pct=round(pnl_pct, 2),
+                exit_reason=exit_reason,
+                gap_pct=round(gap_pct, 2),
+                rvol=round(rvol, 2),
             )
-            bars = self.data_client.get_stock_bars(req)
-            df = bars.df.reset_index()
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.droplevel(0)
-            if len(df) < 3:
-                return result
+            result.trades.append(trade)
 
-            # Simulate day-by-day
-            for i in range(1, len(df) - 1):
-                prev = df.iloc[i - 1]
-                today = df.iloc[i]
-                next_day = df.iloc[i + 1]
-
-                prev_close = float(prev["close"])
-                open_price = float(today["open"])
-                high = float(today["high"])
-                low = float(today["low"])
-                today_vol = float(today["volume"])
-
-                # Approximate avg volume (last 20 days)
-                hist_slice = df.iloc[max(0, i - 20):i]
-                avg_vol = float(hist_slice["volume"].mean()) if len(hist_slice) > 0 else 1
-                rvol = today_vol / avg_vol if avg_vol > 0 else 0
-
-                # Gap filter
-                gap_pct = ((open_price - prev_close) / prev_close) * 100
-                if gap_pct < config.MIN_GAP_PCT:
-                    continue
-                if rvol < config.MIN_RVOL:
-                    continue
-                if not (config.MIN_PRICE <= open_price <= config.MAX_PRICE):
-                    continue
-
-                # Simple ORB simulation:
-                # Entry = open, Stop = open - ATR*0.5, Target = entry + risk * TAKE_PROFIT_R
-                atr_slice = df.iloc[max(0, i - 14):i]
-                if len(atr_slice) > 1:
-                    tr_vals = []
-                    for j in range(1, len(atr_slice)):
-                        h = float(atr_slice.iloc[j]["high"])
-                        l = float(atr_slice.iloc[j]["low"])
-                        c_prev = float(atr_slice.iloc[j-1]["close"])
-                        tr_vals.append(max(h - l, abs(h - c_prev), abs(l - c_prev)))
-                    atr = float(pd.Series(tr_vals).mean())
-                else:
-                    atr = open_price * 0.02
-
-                entry = open_price
-                stop = entry - atr * 0.5
-                risk = entry - stop
-                if risk <= 0:
-                    continue
-                target = entry + risk * config.TAKE_PROFIT_R
-                shares = max(1, int(config.RISK_PER_TRADE / risk))
-
-                # Simulate: did high touch target? did low touch stop?
-                hit_target = high >= target
-                hit_stop = low <= stop
-
-                if hit_target and not hit_stop:
-                    outcome = "WIN"
-                    exit_price = target
-                elif hit_stop and not hit_target:
-                    outcome = "LOSS"
-                    exit_price = stop
-                elif hit_target and hit_stop:
-                    # Ambiguous - assume stop hit first (conservative)
-                    outcome = "LOSS"
-                    exit_price = stop
-                else:
-                    # Neither hit - exit at next open (day close)
-                    outcome = "OPEN"
-                    exit_price = float(next_day["open"])
-
-                pnl = (exit_price - entry) * shares
-
-                result.trades.append(BacktestTrade(
-                    symbol=symbol,
-                    strategy="ORB_SIM",
-                    entry_date=str(today.get("timestamp", "") or today.name),
-                    entry_price=round(entry, 2),
-                    stop_loss=round(stop, 2),
-                    take_profit=round(target, 2),
-                    exit_price=round(exit_price, 2),
-                    pnl=round(pnl, 2),
-                    outcome=outcome,
-                    shares=shares,
-                ))
-
-        except Exception as exc:
-            log.error(f"Backtest error for {symbol}: {exc}")
+        # Aggregate stats
+        result.total_trades = len(result.trades)
+        if result.trades:
+            result.total_pnl = round(sum(t.pnl for t in result.trades), 2)
+            winners = [t for t in result.trades if t.pnl > 0]
+            losers  = [t for t in result.trades if t.pnl <= 0]
+            result.win_rate  = round(len(winners) / result.total_trades * 100, 1)
+            result.avg_win   = round(sum(t.pnl for t in winners) / len(winners), 2) if winners else 0
+            result.avg_loss  = round(sum(t.pnl for t in losers)  / len(losers),  2) if losers  else 0
+            result.max_drawdown = round((peak - equity) / peak * 100, 2) if peak else 0
 
         return result
+
+    def print_report(self, results: List[BacktestResult]) -> None:
+        from rich.console import Console
+        from rich.table import Table
+        console = Console()
+        table = Table(title="Backtest Results", show_lines=True)
+        table.add_column("Symbol",   style="cyan")
+        table.add_column("Trades",   justify="right")
+        table.add_column("Win%",     justify="right")
+        table.add_column("Total P&L", justify="right")
+        table.add_column("Avg Win",  justify="right")
+        table.add_column("Avg Loss", justify="right")
+        table.add_column("MaxDD%",   justify="right")
+
+        for r in results:
+            pnl_color = "green" if r.total_pnl >= 0 else "red"
+            table.add_row(
+                r.symbol,
+                str(r.total_trades),
+                f"{r.win_rate:.1f}%",
+                f"[{pnl_color}]${r.total_pnl:+,.2f}[/{pnl_color}]",
+                f"${r.avg_win:,.2f}",
+                f"${r.avg_loss:,.2f}",
+                f"{r.max_drawdown:.1f}%",
+            )
+        console.print(table)
+
+        for r in results:
+            if r.trades:
+                console.print(f"\n[bold]{r.symbol} — last 5 trades:[/bold]")
+                for t in r.trades[-5:]:
+                    color = "green" if t.pnl > 0 else "red"
+                    console.print(
+                        f"  {t.entry_date} | entry=${t.entry_price} "
+                        f"exit=${t.exit_price} ({t.exit_reason}) "
+                        f"[{color}]P&L=${t.pnl:+.2f}[/{color}] "
+                        f"gap={t.gap_pct:+.1f}% rvol={t.rvol:.1f}x"
+                    )
